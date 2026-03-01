@@ -7,6 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
 const BIND_ADDR: &str = "127.0.0.1:4221";
 
 struct Request {
@@ -217,12 +220,23 @@ fn handle_request(request: &Request, directory: &str) -> Response {
     match request.path.as_str() {
         "/" => ok_text(String::new()),
         p if p.starts_with("/echo/") => {
-            let encode = request.get_header("Accept-Encoding").unwrap_or("");
-            let mut resp = ok_text(p.strip_prefix("/echo/").unwrap().to_string());
-            if encode.contains("gzip") {
-                resp = resp.with_header("Content-Encoding", "gzip");
+            let echo_text = p.strip_prefix("/echo/").unwrap().to_string();
+            let accepts_gzip = request
+                .get_header("Accept-Encoding")
+                .map(|e| e.contains("gzip"))
+                .unwrap_or(false);
+
+            if accepts_gzip {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(echo_text.as_bytes()).unwrap();
+                let compressed = encoder.finish().unwrap();
+                Response::new(200, "OK")
+                    .with_content_type("text/plain")
+                    .with_header("Content-Encoding", "gzip")
+                    .with_body(compressed)
+            } else {
+                ok_text(echo_text)
             }
-            resp
         }
         "/user-agent" => {
             let ua = request.get_header("User-Agent").unwrap_or("");
