@@ -128,6 +128,14 @@ impl Response {
         self
     }
 
+    fn with_connection_close(self, should_close: bool) -> Self {
+        if should_close {
+            self.with_header("Connection", "close")
+        } else {
+            self
+        }
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         let mut headers = format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text);
 
@@ -145,28 +153,30 @@ impl Response {
     }
 }
 
-fn ok_text(body: String) -> Response {
+fn ok_text(body: String, should_close: bool) -> Response {
     Response::new(200, "OK")
         .with_content_type("text/plain")
         .with_text_body(body)
+        .with_connection_close(should_close)
 }
 
-fn ok_binary(body: Vec<u8>) -> Response {
+fn ok_binary(body: Vec<u8>, should_close: bool) -> Response {
     Response::new(200, "OK")
         .with_content_type("application/octet-stream")
         .with_body(body)
+        .with_connection_close(should_close)
 }
 
-fn created() -> Response {
-    Response::new(201, "Created")
+fn created(should_close: bool) -> Response {
+    Response::new(201, "Created").with_connection_close(should_close)
 }
 
-fn not_found() -> Response {
-    Response::new(404, "Not Found")
+fn not_found(should_close: bool) -> Response {
+    Response::new(404, "Not Found").with_connection_close(should_close)
 }
 
-fn internal_error() -> Response {
-    Response::new(500, "Internal Server Error")
+fn internal_error(should_close: bool) -> Response {
+    Response::new(500, "Internal Server Error").with_connection_close(should_close)
 }
 
 fn main() {
@@ -212,7 +222,7 @@ fn handle_connection(stream: &mut (impl Read + Write), directory: &str) {
         let request = match Request::parse(&buffer[..bytes_read]) {
             Ok(req) => req,
             Err(_) => {
-                stream.write_all(&internal_error().to_bytes()).unwrap();
+                stream.write_all(&internal_error(true).to_bytes()).unwrap();
                 break;
             }
         };
@@ -222,7 +232,7 @@ fn handle_connection(stream: &mut (impl Read + Write), directory: &str) {
             .map(|c| c.eq_ignore_ascii_case("close"))
             .unwrap_or(false);
 
-        let response = handle_request(&request, directory);
+        let response = handle_request(&request, directory, should_close);
         stream.write_all(&response.to_bytes()).unwrap();
 
         if should_close {
@@ -231,9 +241,9 @@ fn handle_connection(stream: &mut (impl Read + Write), directory: &str) {
     }
 }
 
-fn handle_request(request: &Request, directory: &str) -> Response {
+fn handle_request(request: &Request, directory: &str, should_close: bool) -> Response {
     match request.path.as_str() {
-        "/" => ok_text(String::new()),
+        "/" => ok_text(String::new(), should_close),
         p if p.starts_with("/echo/") => {
             let echo_text = p.strip_prefix("/echo/").unwrap().to_string();
             let accepts_gzip = request
@@ -248,36 +258,37 @@ fn handle_request(request: &Request, directory: &str) -> Response {
                 Response::new(200, "OK")
                     .with_content_type("text/plain")
                     .with_header("Content-Encoding", "gzip")
+                    .with_connection_close(should_close)
                     .with_body(compressed)
             } else {
-                ok_text(echo_text)
+                ok_text(echo_text, should_close)
             }
         }
         "/user-agent" => {
             let ua = request.get_header("User-Agent").unwrap_or("");
-            ok_text(ua.to_string())
+            ok_text(ua.to_string(), should_close)
         }
-        p if p.starts_with("/files/") => handle_files(&request.method, p, directory, &request.body),
-        _ => not_found(),
+        p if p.starts_with("/files/") => handle_files(&request.method, p, directory, &request.body, should_close),
+        _ => not_found(should_close),
     }
 }
 
-fn handle_files(method: &str, path: &str, directory: &str, body: &[u8]) -> Response {
+fn handle_files(method: &str, path: &str, directory: &str, body: &[u8], should_close: bool) -> Response {
     let filename = path.strip_prefix("/files/").unwrap();
     let file_path = Path::new(directory).join(filename);
 
     match method.to_lowercase().as_str() {
         "get" => {
             if !file_path.exists() || !file_path.is_file() {
-                return not_found();
+                return not_found(should_close);
             }
             fs::read(&file_path)
-                .map(ok_binary)
-                .unwrap_or_else(|_| internal_error())
+                .map(|data| ok_binary(data, should_close))
+                .unwrap_or_else(|_| internal_error(should_close))
         }
         "post" => fs::write(&file_path, body)
-            .map(|_| created())
-            .unwrap_or_else(|_| internal_error()),
-        _ => not_found(),
+            .map(|_| created(should_close))
+            .unwrap_or_else(|_| internal_error(should_close)),
+        _ => not_found(should_close),
     }
 }
