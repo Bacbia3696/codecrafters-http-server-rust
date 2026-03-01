@@ -1,27 +1,31 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::thread;
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
     println!("Server is listening on 127.0.0.1:4221...");
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let client_addr = stream.peer_addr().unwrap();
-                println!("New connection from {}", client_addr);
+    loop {
+        let stream = listener.accept();
+        thread::spawn(move || {
+            // Handle the stream
+            match stream {
+                Ok((mut stream, client_addr)) => {
+                    println!("New connection from {}", client_addr);
 
-                let mut buffer = [0u8; 1024];
-                let bytes_read = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let mut buffer = [0u8; 1024];
+                    let bytes_read = stream.read(&mut buffer).unwrap();
+                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
 
-                let response = handle_request(&request);
-                stream.write_all(response.as_bytes()).unwrap();
+                    let response = handle_request(&request);
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+                Err(e) => {
+                    println!("error: {}", e);
+                }
             }
-            Err(e) => {
-                println!("error: {}", e);
-            }
-        }
+        });
     }
 }
 
