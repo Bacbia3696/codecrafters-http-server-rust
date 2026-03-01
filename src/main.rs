@@ -36,7 +36,7 @@ fn handle_request(request: &str) -> String {
         }
     }
 
-    let path = parts[1];
+    let path = parts.get(1).copied().unwrap_or("");
     if let Some(message) = path.strip_prefix("/echo/") {
         return format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
@@ -44,5 +44,26 @@ fn handle_request(request: &str) -> String {
             message
         );
     }
+
+    if path == "/user-agent" {
+        let user_agent = parse_header(request, "User-Agent").unwrap_or("");
+        return format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            user_agent.len(),
+            user_agent
+        );
+    }
+
     "HTTP/1.1 404 Not Found\r\n\r\n".to_string()
+}
+
+fn parse_header<'a>(request: &'a str, header_name: &str) -> Option<&'a str> {
+    for line in request.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case(header_name) {
+                return Some(value.trim());
+            }
+        }
+    }
+    None
 }
