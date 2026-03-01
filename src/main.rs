@@ -201,19 +201,34 @@ fn parse_directory_arg(args: &[String]) -> Option<String> {
 }
 
 fn handle_connection(stream: &mut (impl Read + Write), directory: &str) {
-    let mut buffer = [0u8; 4096];
-    let bytes_read = stream.read(&mut buffer).unwrap();
+    loop {
+        let mut buffer = [0u8; 4096];
+        let bytes_read = match stream.read(&mut buffer) {
+            Ok(0) => break, // Connection closed by client
+            Ok(n) => n,
+            Err(_) => break,
+        };
 
-    let request = match Request::parse(&buffer[..bytes_read]) {
-        Ok(req) => req,
-        Err(_) => {
-            stream.write_all(&internal_error().to_bytes()).unwrap();
-            return;
+        let request = match Request::parse(&buffer[..bytes_read]) {
+            Ok(req) => req,
+            Err(_) => {
+                stream.write_all(&internal_error().to_bytes()).unwrap();
+                break;
+            }
+        };
+
+        let should_close = request
+            .get_header("Connection")
+            .map(|c| c.eq_ignore_ascii_case("close"))
+            .unwrap_or(false);
+
+        let response = handle_request(&request, directory);
+        stream.write_all(&response.to_bytes()).unwrap();
+
+        if should_close {
+            break;
         }
-    };
-
-    let response = handle_request(&request, directory);
-    stream.write_all(&response.to_bytes()).unwrap();
+    }
 }
 
 fn handle_request(request: &Request, directory: &str) -> Response {
