@@ -6,14 +6,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
+const BIND_ADDR: &str = "127.0.0.1:4221";
+
 enum ResponseBody {
     Text(String),
     Binary(Vec<u8>),
 }
 
 struct Response {
-    status: String,
-    content_type: Option<String>,
+    status: &'static str,
+    content_type: Option<&'static str>,
     body: ResponseBody,
 }
 
@@ -23,87 +25,125 @@ impl Response {
             ResponseBody::Text(s) => s.as_bytes().to_vec(),
             ResponseBody::Binary(b) => b.clone(),
         };
-        let mut response = match &self.content_type {
-            Some(content_type) => format!(
+
+        let headers = match self.content_type {
+            Some(ct) => format!(
                 "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
                 self.status,
-                content_type,
+                ct,
                 body_bytes.len()
-            )
-            .into_bytes(),
+            ),
             None => format!(
                 "HTTP/1.1 {}\r\nContent-Length: {}\r\n\r\n",
                 self.status,
                 body_bytes.len()
-            )
-            .into_bytes(),
+            ),
         };
-        response.extend(body_bytes);
-        response
+
+        [headers.into_bytes(), body_bytes].concat()
+    }
+}
+
+fn ok_text(body: String) -> Response {
+    Response {
+        status: "200 OK",
+        content_type: Some("text/plain"),
+        body: ResponseBody::Text(body),
+    }
+}
+
+fn ok_binary(body: Vec<u8>) -> Response {
+    Response {
+        status: "200 OK",
+        content_type: Some("application/octet-stream"),
+        body: ResponseBody::Binary(body),
+    }
+}
+
+fn created() -> Response {
+    Response {
+        status: "201 Created",
+        content_type: None,
+        body: ResponseBody::Text(String::new()),
+    }
+}
+
+fn not_found() -> Response {
+    Response {
+        status: "404 Not Found",
+        content_type: None,
+        body: ResponseBody::Text(String::new()),
+    }
+}
+
+fn internal_error() -> Response {
+    Response {
+        status: "500 Internal Server Error",
+        content_type: None,
+        body: ResponseBody::Text(String::new()),
     }
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let mut directory = String::new();
-
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--directory" && i + 1 < args.len() {
-            directory = args[i + 1].clone();
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-
+    let directory = parse_directory_arg(&args).unwrap_or_default();
     let directory = Arc::new(directory);
-    let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
-    println!("Server is listening on 127.0.0.1:4221...");
 
-    loop {
-        let stream = listener.accept();
+    let listener = TcpListener::bind(BIND_ADDR).unwrap();
+    println!("Server is listening on {}...", BIND_ADDR);
+
+    for stream in listener.incoming() {
         let directory = Arc::clone(&directory);
-        thread::spawn(move || {
-            // Handle the stream
-            match stream {
-                Ok((mut stream, client_addr)) => {
-                    println!("New connection from {}", client_addr);
-
-                    let mut buffer = [0u8; 4096];
-                    let bytes_read = stream.read(&mut buffer).unwrap();
-                    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-
-                    let (method, path) = parse_request_line(&request);
-                    let content_length = parse_content_length(&request);
-                    let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-                    let body = if body_start < bytes_read {
-                        &buffer[body_start..bytes_read]
-                    } else {
-                        &[]
-                    };
-
-                    let response = handle_request(&method, &path, &request, &directory, content_length, body);
-                    stream.write_all(&response.to_bytes()).unwrap();
-                }
-                Err(e) => {
-                    println!("error: {}", e);
-                }
+        thread::spawn(move || match stream {
+            Ok(mut stream) => {
+                let client_addr = stream.peer_addr().unwrap();
+                println!("New connection from {}", client_addr);
+                handle_connection(&mut stream, &directory);
             }
+            Err(e) => println!("error: {}", e),
         });
     }
 }
 
+fn parse_directory_arg(args: &[String]) -> Option<String> {
+    args.windows(2).find_map(|w| {
+        if w[0] == "--directory" {
+            Some(w[1].clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn handle_connection(stream: &mut (impl Read + Write), directory: &str) {
+    let mut buffer = [0u8; 4096];
+    let bytes_read = stream.read(&mut buffer).unwrap();
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+
+    let (method, path) = parse_request_line(&request);
+    let body = extract_body(&request, &buffer, bytes_read);
+
+    let response = handle_request(&method, &path, &request, directory, body);
+    stream.write_all(&response.to_bytes()).unwrap();
+}
+
 fn parse_request_line(request: &str) -> (String, String) {
-    let request_line = request.lines().next().unwrap_or("");
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    let parts: Vec<&str> = request
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
     let method = parts.first().copied().unwrap_or("").to_string();
     let path = parts.get(1).copied().unwrap_or("").to_string();
     (method, path)
 }
 
-fn parse_content_length(request: &str) -> Option<usize> {
-    parse_header(request, "Content-Length").and_then(|v| v.parse().ok())
+fn extract_body<'a>(request: &'a str, buffer: &'a [u8], bytes_read: usize) -> &'a [u8] {
+    request
+        .find("\r\n\r\n")
+        .map(|i| &buffer[(i + 4)..bytes_read])
+        .unwrap_or(&[])
 }
 
 fn handle_request(
@@ -111,95 +151,48 @@ fn handle_request(
     path: &str,
     request: &str,
     directory: &str,
-    _content_length: Option<usize>,
     body: &[u8],
 ) -> Response {
-    if path == "/" {
-        return Response {
-            status: "200 OK".to_string(),
-            content_type: Some("text/plain".to_string()),
-            body: ResponseBody::Text(String::new()),
-        };
-    }
-
-    if let Some(message) = path.strip_prefix("/echo/") {
-        return Response {
-            status: "200 OK".to_string(),
-            content_type: Some("text/plain".to_string()),
-            body: ResponseBody::Text(message.to_string()),
-        };
-    }
-
-    if path == "/user-agent" {
-        let user_agent = parse_header(request, "User-Agent").unwrap_or("");
-        return Response {
-            status: "200 OK".to_string(),
-            content_type: Some("text/plain".to_string()),
-            body: ResponseBody::Text(user_agent.to_string()),
-        };
-    }
-
-    if let Some(filename) = path.strip_prefix("/files/") {
-        let file_path = Path::new(directory).join(filename);
-
-        match method.to_lowercase().as_str() {
-            "get" => {
-                if !file_path.exists() || !file_path.is_file() {
-                    return Response {
-                        status: "404 Not Found".to_string(),
-                        content_type: None,
-                        body: ResponseBody::Text(String::new()),
-                    };
-                }
-                match fs::read(&file_path) {
-                    Ok(contents) => Response {
-                        status: "200 OK".to_string(),
-                        content_type: Some("application/octet-stream".to_string()),
-                        body: ResponseBody::Binary(contents),
-                    },
-                    Err(_) => Response {
-                        status: "500 Internal Server Error".to_string(),
-                        content_type: None,
-                        body: ResponseBody::Text(String::new()),
-                    },
-                }
-            }
-            "post" => {
-                match fs::write(&file_path, body) {
-                    Ok(_) => Response {
-                        status: "201 Created".to_string(),
-                        content_type: None,
-                        body: ResponseBody::Text(String::new()),
-                    },
-                    Err(_) => Response {
-                        status: "500 Internal Server Error".to_string(),
-                        content_type: None,
-                        body: ResponseBody::Text(String::new()),
-                    },
-                }
-            }
-            _ => Response {
-                status: "405 Method Not Allowed".to_string(),
-                content_type: None,
-                body: ResponseBody::Text(String::new()),
-            },
+    match path {
+        "/" => ok_text(String::new()),
+        p if p.starts_with("/echo/") => ok_text(p.strip_prefix("/echo/").unwrap().to_string()),
+        "/user-agent" => {
+            let ua = parse_header(request, "User-Agent").unwrap_or("");
+            ok_text(ua.to_string())
         }
-    } else {
-        Response {
-            status: "404 Not Found".to_string(),
-            content_type: None,
-            body: ResponseBody::Text(String::new()),
+        p if p.starts_with("/files/") => handle_files(method, p, directory, body),
+        _ => not_found(),
+    }
+}
+
+fn handle_files(method: &str, path: &str, directory: &str, body: &[u8]) -> Response {
+    let filename = path.strip_prefix("/files/").unwrap();
+    let file_path = Path::new(directory).join(filename);
+
+    match method.to_lowercase().as_str() {
+        "get" => {
+            if !file_path.exists() || !file_path.is_file() {
+                return not_found();
+            }
+            fs::read(&file_path)
+                .map(ok_binary)
+                .unwrap_or_else(|_| internal_error())
         }
+        "post" => fs::write(&file_path, body)
+            .map(|_| created())
+            .unwrap_or_else(|_| internal_error()),
+        _ => not_found(),
     }
 }
 
 fn parse_header<'a>(request: &'a str, header_name: &str) -> Option<&'a str> {
-    for line in request.lines() {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case(header_name)
-        {
-            return Some(value.trim());
-        }
-    }
-    None
+    request.lines().find_map(|line| {
+        line.split_once(':').and_then(|(name, value)| {
+            if name.trim().eq_ignore_ascii_case(header_name) {
+                Some(value.trim())
+            } else {
+                None
+            }
+        })
+    })
 }
