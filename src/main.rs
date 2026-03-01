@@ -36,5 +36,13 @@ fn handle_request(request: &str) -> String {
         }
     }
 
+    let path = parts[1];
+    if let Some(message) = path.strip_prefix("/echo/") {
+        return format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            message.len(),
+            message
+        );
+    }
     "HTTP/1.1 404 Not Found\r\n\r\n".to_string()
 }
