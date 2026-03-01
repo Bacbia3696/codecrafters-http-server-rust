@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -8,80 +9,161 @@ use std::thread;
 
 const BIND_ADDR: &str = "127.0.0.1:4221";
 
-enum ResponseBody {
-    Text(String),
-    Binary(Vec<u8>),
+struct Request {
+    method: String,
+    path: String,
+    #[allow(dead_code, unused)]
+    query_params: HashMap<String, String>,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl Request {
+    fn parse(raw: &[u8]) -> Result<Self, String> {
+        let request_str = String::from_utf8_lossy(raw);
+        let mut lines = request_str.lines();
+
+        // Parse request line
+        let request_line = lines.next().unwrap_or("");
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let full_path = parts.next().unwrap_or("");
+
+        // Split path and query string
+        let (path, query_params) = parse_path_and_query(full_path);
+
+        // Parse headers
+        let mut headers = HashMap::new();
+        let mut body_start = 0;
+        for line in lines {
+            if line.is_empty() {
+                body_start = request_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                headers.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+
+        // Extract body
+        let body = if body_start > 0 {
+            raw[body_start..].to_vec()
+        } else {
+            vec![]
+        };
+
+        Ok(Request {
+            method,
+            path,
+            query_params,
+            headers,
+            body,
+        })
+    }
+
+    fn get_header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+fn parse_path_and_query(full_path: &str) -> (String, HashMap<String, String>) {
+    let mut query_params = HashMap::new();
+    let path = full_path
+        .split_once('?')
+        .map(|(path, query)| {
+            for param in query.split('&') {
+                if let Some((key, value)) = param.split_once('=') {
+                    query_params.insert(key.to_string(), value.to_string());
+                }
+            }
+            path
+        })
+        .unwrap_or(full_path)
+        .to_string();
+
+    (path, query_params)
 }
 
 struct Response {
-    status: &'static str,
-    content_type: Option<&'static str>,
-    body: ResponseBody,
+    status_code: u16,
+    status_text: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
 }
 
 impl Response {
+    fn new(status_code: u16, status_text: &str) -> Self {
+        Response {
+            status_code,
+            status_text: status_text.to_string(),
+            headers: HashMap::new(),
+            body: vec![],
+        }
+    }
+
+    fn with_content_type(mut self, content_type: &str) -> Self {
+        self.headers
+            .insert("Content-Type".to_string(), content_type.to_string());
+        self
+    }
+
+    fn with_body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+        self
+    }
+
+    fn with_text_body(mut self, text: String) -> Self {
+        self.body = text.into_bytes();
+        self
+    }
+
+    fn with_header(mut self, key: &str, value: &str) -> Self {
+        self.headers.insert(key.to_string(), value.to_string());
+        self
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
-        let body_bytes = match &self.body {
-            ResponseBody::Text(s) => s.as_bytes().to_vec(),
-            ResponseBody::Binary(b) => b.clone(),
-        };
+        let mut headers = format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text);
 
-        let headers = match self.content_type {
-            Some(ct) => format!(
-                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
-                self.status,
-                ct,
-                body_bytes.len()
-            ),
-            None => format!(
-                "HTTP/1.1 {}\r\nContent-Length: {}\r\n\r\n",
-                self.status,
-                body_bytes.len()
-            ),
-        };
+        // Add Content-Length
+        headers.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
 
-        [headers.into_bytes(), body_bytes].concat()
+        // Add other headers
+        for (key, value) in &self.headers {
+            headers.push_str(&format!("{}: {}\r\n", key, value));
+        }
+
+        headers.push_str("\r\n");
+
+        [headers.into_bytes(), self.body.clone()].concat()
     }
 }
 
 fn ok_text(body: String) -> Response {
-    Response {
-        status: "200 OK",
-        content_type: Some("text/plain"),
-        body: ResponseBody::Text(body),
-    }
+    Response::new(200, "OK")
+        .with_content_type("text/plain")
+        .with_text_body(body)
 }
 
 fn ok_binary(body: Vec<u8>) -> Response {
-    Response {
-        status: "200 OK",
-        content_type: Some("application/octet-stream"),
-        body: ResponseBody::Binary(body),
-    }
+    Response::new(200, "OK")
+        .with_content_type("application/octet-stream")
+        .with_body(body)
 }
 
 fn created() -> Response {
-    Response {
-        status: "201 Created",
-        content_type: None,
-        body: ResponseBody::Text(String::new()),
-    }
+    Response::new(201, "Created")
 }
 
 fn not_found() -> Response {
-    Response {
-        status: "404 Not Found",
-        content_type: None,
-        body: ResponseBody::Text(String::new()),
-    }
+    Response::new(404, "Not Found")
 }
 
 fn internal_error() -> Response {
-    Response {
-        status: "500 Internal Server Error",
-        content_type: None,
-        body: ResponseBody::Text(String::new()),
-    }
+    Response::new(500, "Internal Server Error")
 }
 
 fn main() {
@@ -118,49 +200,35 @@ fn parse_directory_arg(args: &[String]) -> Option<String> {
 fn handle_connection(stream: &mut (impl Read + Write), directory: &str) {
     let mut buffer = [0u8; 4096];
     let bytes_read = stream.read(&mut buffer).unwrap();
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
 
-    let (method, path) = parse_request_line(&request);
-    let body = extract_body(&request, &buffer, bytes_read);
+    let request = match Request::parse(&buffer[..bytes_read]) {
+        Ok(req) => req,
+        Err(_) => {
+            stream.write_all(&internal_error().to_bytes()).unwrap();
+            return;
+        }
+    };
 
-    let response = handle_request(&method, &path, &request, directory, body);
+    let response = handle_request(&request, directory);
     stream.write_all(&response.to_bytes()).unwrap();
 }
 
-fn parse_request_line(request: &str) -> (String, String) {
-    let parts: Vec<&str> = request
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect();
-    let method = parts.first().copied().unwrap_or("").to_string();
-    let path = parts.get(1).copied().unwrap_or("").to_string();
-    (method, path)
-}
-
-fn extract_body<'a>(request: &'a str, buffer: &'a [u8], bytes_read: usize) -> &'a [u8] {
-    request
-        .find("\r\n\r\n")
-        .map(|i| &buffer[(i + 4)..bytes_read])
-        .unwrap_or(&[])
-}
-
-fn handle_request(
-    method: &str,
-    path: &str,
-    request: &str,
-    directory: &str,
-    body: &[u8],
-) -> Response {
-    match path {
+fn handle_request(request: &Request, directory: &str) -> Response {
+    match request.path.as_str() {
         "/" => ok_text(String::new()),
-        p if p.starts_with("/echo/") => ok_text(p.strip_prefix("/echo/").unwrap().to_string()),
+        p if p.starts_with("/echo/") => {
+            let encode = request.get_header("Accept-Encoding").unwrap_or("");
+            let mut resp = ok_text(p.strip_prefix("/echo/").unwrap().to_string());
+            if encode.contains("gzip") {
+                resp = resp.with_header("Content-Encoding", "gzip");
+            }
+            resp
+        }
         "/user-agent" => {
-            let ua = parse_header(request, "User-Agent").unwrap_or("");
+            let ua = request.get_header("User-Agent").unwrap_or("");
             ok_text(ua.to_string())
         }
-        p if p.starts_with("/files/") => handle_files(method, p, directory, body),
+        p if p.starts_with("/files/") => handle_files(&request.method, p, directory, &request.body),
         _ => not_found(),
     }
 }
@@ -183,16 +251,4 @@ fn handle_files(method: &str, path: &str, directory: &str, body: &[u8]) -> Respo
             .unwrap_or_else(|_| internal_error()),
         _ => not_found(),
     }
-}
-
-fn parse_header<'a>(request: &'a str, header_name: &str) -> Option<&'a str> {
-    request.lines().find_map(|line| {
-        line.split_once(':').and_then(|(name, value)| {
-            if name.trim().eq_ignore_ascii_case(header_name) {
-                Some(value.trim())
-            } else {
-                None
-            }
-        })
-    })
 }
